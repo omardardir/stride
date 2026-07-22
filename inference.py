@@ -18,7 +18,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 # ---------------------------------------------------------------------------
 MODEL_ID       = "Qwen/Qwen2.5-1.5B-Instruct"
 MAX_NEW_TOKENS = 512
-TEMPERATURE    = 0.7
+TEMPERATURE    = 0.0
 TOP_P          = 0.9
 DEVICE         = "cuda"
 
@@ -91,9 +91,9 @@ def generate(
         model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
             pad_token_id=tokenizer.eos_token_id,
             streamer=streamer,
         )

@@ -11,7 +11,7 @@ Requirements:
 
 import sys
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -59,7 +59,154 @@ def load_model():
 
 
 # ---------------------------------------------------------------------------
-# Inference (streaming)
+# Naive KV Cache Manager
+# ---------------------------------------------------------------------------
+class NaiveKVCache:
+    """
+    Naive KV cache that wraps the past_key_values tuple returned by the model.
+
+    This is intentionally simple so the generation loop is easy to follow:
+      - On the first forward pass (prefill) we store the full KV cache.
+      - On every subsequent decode step we append the new single-token KV
+        entries returned by the model to the stored cache.
+      - We expose the cache as `past_key_values`, which is the exact format
+        the HuggingFace model expects as input.
+
+    Later this class can be replaced with a PagedAttention / chunked-prefill
+    implementation without touching the generation loop.
+    """
+
+    def __init__(self):
+        # past_key_values is a tuple of (key, value) pairs, one per layer.
+        # Each key/value tensor has shape [batch, heads, seq_len, head_dim].
+        self.past_key_values = None
+
+    def update(self, new_past_key_values):
+        """Replace the cache with the freshly returned past_key_values.
+
+        Because HuggingFace models return the *full* past_key_values (old +
+        new token appended) when use_cache=True, we simply overwrite.
+        """
+        self.past_key_values = new_past_key_values
+
+    def is_empty(self) -> bool:
+        return self.past_key_values is None
+
+    def seq_len(self) -> int:
+        """Number of tokens currently cached (reads from the first layer key)."""
+        if self.is_empty():
+            return 0
+        # Shape: [batch, heads, seq_len, head_dim]
+        return self.past_key_values[0][0].shape[2]
+
+
+# ---------------------------------------------------------------------------
+# Sampling helpers
+# ---------------------------------------------------------------------------
+def _top_p_filter(logits: torch.Tensor, top_p: float) -> torch.Tensor:
+    """Zero out logits below the nucleus threshold."""
+    sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
+    cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+
+    # Remove tokens with cumulative prob above top_p
+    sorted_indices_to_remove = cumulative_probs - sorted_logits.softmax(dim=-1) > top_p
+    sorted_logits[sorted_indices_to_remove] = float("-inf")
+
+    # Scatter back to original indexing
+    filtered = torch.full_like(logits, float("-inf"))
+    filtered.scatter_(dim=-1, index=sorted_indices, src=sorted_logits)
+    return filtered
+
+
+def _sample_next_token(
+    logits: torch.Tensor,        # shape [1, vocab_size]
+    temperature: float,
+    top_p: float,
+) -> int:
+    """Apply temperature + top-p then sample one token id."""
+    logits = logits[0]                           # [vocab_size]
+    logits = logits / max(temperature, 1e-8)
+    logits = _top_p_filter(logits, top_p)
+    probs  = torch.softmax(logits, dim=-1)
+    token_id = torch.multinomial(probs, num_samples=1).item()
+    return token_id
+
+
+# ---------------------------------------------------------------------------
+# Custom generation loop
+# ---------------------------------------------------------------------------
+def _run_generation(
+    model,
+    input_ids: torch.Tensor,          # [1, prompt_len]
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: int,
+) -> list[int]:
+    """
+    Token-by-token generation with a naive KV cache.
+
+    Step 1 – Prefill:  feed the whole prompt in one forward pass, get KV cache.
+    Step 2 – Decode:   feed one new token per step, reuse the KV cache.
+
+    Returns the list of newly generated token ids (not including the prompt).
+    """
+    kv_cache = NaiveKVCache()
+    generated_ids: list[int] = []
+
+    # ---- Prefill --------------------------------------------------------
+    with torch.inference_mode():
+        outputs = model(
+            input_ids=input_ids,
+            past_key_values=None,       # no cache yet
+            use_cache=True,
+            return_dict=True,
+        )
+
+    # outputs.logits: [1, prompt_len, vocab_size]
+    # We only need the logits for the last prompt token to sample the first
+    # generated token.
+    next_token_id = _sample_next_token(
+        outputs.logits[:, -1, :],
+        temperature,
+        top_p,
+    )
+    kv_cache.update(outputs.past_key_values)
+    generated_ids.append(next_token_id)
+
+    if next_token_id == eos_token_id:
+        return generated_ids
+
+    # ---- Decode loop ----------------------------------------------------
+    for _ in range(max_new_tokens - 1):
+        # next input is just the single newly generated token
+        next_input = torch.tensor([[next_token_id]], dtype=torch.long, device=DEVICE)
+
+        with torch.inference_mode():
+            outputs = model(
+                input_ids=next_input,
+                past_key_values=kv_cache.past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+
+        # outputs.logits: [1, 1, vocab_size]
+        next_token_id = _sample_next_token(
+            outputs.logits[:, -1, :],
+            temperature,
+            top_p,
+        )
+        kv_cache.update(outputs.past_key_values)
+        generated_ids.append(next_token_id)
+
+        if next_token_id == eos_token_id:
+            break
+
+    return generated_ids
+
+
+# ---------------------------------------------------------------------------
+# Public-facing generate function (streaming)
 # ---------------------------------------------------------------------------
 def generate(
     tokenizer,
@@ -70,7 +217,7 @@ def generate(
     temperature: float = TEMPERATURE,
     top_p: float = TOP_P,
 ) -> None:
-    """Stream the assistant reply token-by-token to stdout."""
+    """Run the custom generation loop and stream tokens to stdout."""
     messages = [
         {"role": "system", "content": system},
         {"role": "user",   "content": prompt},
@@ -83,20 +230,28 @@ def generate(
         add_generation_prompt=True,
     )
     inputs = tokenizer([text], return_tensors="pt").to(DEVICE)
+    input_ids = inputs["input_ids"]
 
-    # TextStreamer prints each token to stdout as it is decoded
-    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    # Run our custom loop
+    generated_ids = _run_generation(
+        model=model,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=tokenizer.eos_token_id,
+    )
 
-    with torch.inference_mode():
-        model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.eos_token_id,
-            streamer=streamer,
+    # Stream-decode: print each token as it is decoded
+    for token_id in generated_ids:
+        token_str = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
         )
+        print(token_str, end="", flush=True)
+
+    print()  # newline after the response
 
 
 # ---------------------------------------------------------------------------

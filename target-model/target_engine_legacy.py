@@ -10,18 +10,29 @@ Requirements:
 """
 
 import sys
+import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+# Add the project root to sys.path so we can import profiler.py from the
+# parent directory regardless of where the script is invoked from.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from profiler import Profiler
+
+# ---------------------------------------------------------------------------
+# Profiler — one shared instance for the target engine
+# ---------------------------------------------------------------------------
+profiler = Profiler()  # enabled=True, wall_clock_gpu=True by default
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 MODEL_ID       = "Qwen/Qwen2.5-1.5B-Instruct"
 MAX_NEW_TOKENS = 512
-TEMPERATURE    = 0.0
+TEMPERATURE    = 0.7
 TOP_P          = 0.9
 DEVICE         = "cuda"
-REPETITION_PENALTY = 1.0  # matches HuggingFace GenerationConfig default
+REPETITION_PENALTY = 1.1  # matches HuggingFace GenerationConfig default
 
 # 4-bit NF4 quantization config -- best quality-per-bit for 2 GB VRAM
 QUANT_CONFIG = BitsAndBytesConfig(
@@ -223,28 +234,34 @@ def _run_generation(
     ).unsqueeze(0)  # [1, prompt_len]
 
     with torch.inference_mode():
-        outputs = model(
-            input_ids=input_ids,
-            position_ids=prefill_position_ids,
-            past_key_values=None,       # no cache yet
-            use_cache=True,
-            return_dict=True,
-        )
+        with profiler.time("target", "prefill_ms"):
+            outputs = model(
+                input_ids=input_ids,
+                position_ids=prefill_position_ids,
+                past_key_values=None,       # no cache yet
+                use_cache=True,
+                return_dict=True,
+            )
+    profiler.snapshot_vram("target")
 
     # outputs.logits: [1, prompt_len, vocab_size]
     # We only need the logits for the last prompt token to sample the first
     # generated token.
-    next_token_id = _sample_next_token(
-        outputs.logits[:, -1, :],
-        temperature,
-        top_p,
-        generated_ids,
-        repetition_penalty,
-    )
+    with profiler.time("target", "sample_ms"):
+        next_token_id = _sample_next_token(
+            outputs.logits[:, -1, :],
+            temperature,
+            top_p,
+            generated_ids,
+            repetition_penalty,
+        )
     kv_cache.update(outputs.past_key_values)
     generated_ids.append(next_token_id)
+    profiler.count("target", "tokens_generated", 1)
+    profiler.gauge("target", "kv_seq_len", kv_cache.seq_len())
 
     if next_token_id == eos_token_id:
+        profiler.count("target", "eos_hits", 1)
         return generated_ids
 
     # ---- Decode loop ----------------------------------------------------
@@ -258,26 +275,31 @@ def _run_generation(
         )  # [1, 1]
 
         with torch.inference_mode():
-            outputs = model(
-                input_ids=next_input,
-                position_ids=decode_position_ids,
-                past_key_values=kv_cache.past_key_values,
-                use_cache=True,
-                return_dict=True,
-            )
+            with profiler.time("target", "decode_ms"):
+                outputs = model(
+                    input_ids=next_input,
+                    position_ids=decode_position_ids,
+                    past_key_values=kv_cache.past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
 
         # outputs.logits: [1, 1, vocab_size]
-        next_token_id = _sample_next_token(
-            outputs.logits[:, -1, :],
-            temperature,
-            top_p,
-            generated_ids,
-            repetition_penalty,
-        )
+        with profiler.time("target", "sample_ms"):
+            next_token_id = _sample_next_token(
+                outputs.logits[:, -1, :],
+                temperature,
+                top_p,
+                generated_ids,
+                repetition_penalty,
+            )
         kv_cache.update(outputs.past_key_values)
         generated_ids.append(next_token_id)
+        profiler.count("target", "tokens_generated", 1)
+        profiler.gauge("target", "kv_seq_len", kv_cache.seq_len())
 
         if next_token_id == eos_token_id:
+            profiler.count("target", "eos_hits", 1)
             break
 
     return generated_ids
@@ -317,16 +339,17 @@ def generate(
     inputs = tokenizer([text], return_tensors="pt").to(DEVICE)
     input_ids = inputs["input_ids"]
 
-    # Run our custom loop
-    generated_ids = _run_generation(
-        model=model,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=tokenizer.eos_token_id,
-        repetition_penalty=repetition_penalty,
-    )
+    # Run our custom loop (full request timed end-to-end)
+    with profiler.time_request("target"):
+        generated_ids = _run_generation(
+            model=model,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=tokenizer.eos_token_id,
+            repetition_penalty=repetition_penalty,
+        )
 
     # Stream-decode: print each token as it is decoded
     for token_id in generated_ids:
@@ -338,6 +361,9 @@ def generate(
         print(token_str, end="", flush=True)
 
     print()  # newline after the response
+
+    # Print a live profiler summary after every request
+    profiler.report()
 
 
 # ---------------------------------------------------------------------------

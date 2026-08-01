@@ -21,9 +21,9 @@ Requirements
 -------------
     pip install llama-cpp-python           # CPU build — no CUDA flags needed
     # Download a Q4_K_M GGUF, e.g. from HuggingFace:
-    # huggingface-cli download \
-    #     Qwen/Qwen2-0.5B-Instruct-GGUF \
-    #     qwen2-0_5b-instruct-q4_k_m.gguf \
+    # huggingface-cli download \\
+    #     Qwen/Qwen2-0.5B-Instruct-GGUF \\
+    #     qwen2-0_5b-instruct-q4_k_m.gguf \\
     #     --local-dir ./draft-model/weights/
 
 GGUF path
@@ -47,14 +47,22 @@ quantised cache entries.  That complexity lives in Week 2.
 from __future__ import annotations
 
 import sys
+import os
 import time
 import argparse
-from dataclasses import dataclass, field
+import math
+import ctypes
+from dataclasses import dataclass
 from typing import Optional
+
+# Add the project root to sys.path so we can import profiler.py from the
+# parent directory regardless of where the script is invoked from.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from profiler import Profiler
 
 # llama-cpp-python: pip install llama-cpp-python
 try:
-    from llama_cpp import Llama, llama_token_eos
+    from llama_cpp import Llama
 except ImportError:
     sys.exit(
         "[ERROR] llama-cpp-python is not installed.\n"
@@ -182,12 +190,27 @@ class DraftEngine:
     """
     Minimal CPU draft engine for Qwen2-0.5B-Instruct (GGUF / llama.cpp).
 
+    Parameters
+    ----------
+    llm : Llama
+        A loaded llama-cpp-python model instance.
+    profiler : Profiler | None
+        Optional profiler instance.  Pass ``None`` to disable all
+        instrumentation.  When provided, metrics are tagged with the
+        ``"draft"`` prefix.
+
     Usage (standalone)
     ------------------
         engine = DraftEngine.from_path("path/to/model.gguf")
         engine.load_prompt("Hello, my name is")
         result = engine.draft(gamma=4)
         print(result.token_ids)
+
+    Usage (with profiler)
+    ----------------------
+        from profiler import Profiler
+        prof = Profiler()
+        engine = DraftEngine.from_path("path/to/model.gguf", profiler=prof)
 
     Usage (speculative loop integration)
     --------------------------------------
@@ -204,10 +227,12 @@ class DraftEngine:
     `self.kv.clear()` to reset between independent requests.
     """
 
-    def __init__(self, llm: Llama) -> None:
+    def __init__(self, llm: Llama, profiler: Optional[Profiler] = None) -> None:
         self._llm = llm
+        self._profiler = profiler
         self.kv = NaiveDraftKVCache(llm)
         self._last_token_id: Optional[int] = None  # last token in the seq
+        self._checkpoint_before_draft: int = 0
 
     # ------------------------------------------------------------------
     # Construction
@@ -220,6 +245,7 @@ class DraftEngine:
         n_ctx: int = N_CTX,
         n_threads: int = N_THREADS,
         verbose: bool = False,
+        profiler: Optional[Profiler] = None,
     ) -> "DraftEngine":
         """Load a GGUF model and return a ready-to-use DraftEngine."""
         print(f"[draft] Loading {model_path} ...", flush=True)
@@ -235,7 +261,41 @@ class DraftEngine:
         elapsed = time.perf_counter() - t0
         print(f"[draft] Model loaded in {elapsed:.2f}s  |  n_ctx={n_ctx}  "
               f"n_threads={n_threads}", flush=True)
-        return cls(llm)
+        return cls(llm, profiler=profiler)
+
+    # ------------------------------------------------------------------
+    # Profiler helpers (no-op when profiler is None)
+    # ------------------------------------------------------------------
+
+    def _time(self, metric: str):
+        """Context manager that times a block, or a no-op if no profiler."""
+        if self._profiler is not None:
+            return self._profiler.time("draft", metric)
+        import contextlib
+        return contextlib.nullcontext()
+
+    def _time_request(self):
+        if self._profiler is not None:
+            return self._profiler.time_request("draft")
+        import contextlib
+        return contextlib.nullcontext()
+
+    def _count(self, metric: str, n: int = 1) -> None:
+        if self._profiler is not None:
+            self._profiler.count("draft", metric, n)
+
+    def _gauge(self, metric: str, value: float) -> None:
+        if self._profiler is not None:
+            self._profiler.gauge("draft", metric, value)
+
+    def _last_timing(self, metric: str) -> float:
+        """Read the last recorded sample for a timing metric (ms)."""
+        if self._profiler is None:
+            return 0.0
+        try:
+            return self._profiler._timings["draft"][metric].samples[-1]
+        except (KeyError, IndexError):
+            return 0.0
 
     # ------------------------------------------------------------------
     # Prompt ingestion
@@ -260,9 +320,11 @@ class DraftEngine:
 
         # Run the prefill: eval all prompt tokens in one shot.
         # llama.cpp fills the KV cache internally for positions [0, len).
-        self._llm.eval(token_ids)
+        with self._time("prefill_ms"):
+            self._llm.eval(token_ids)
         self.kv._advance(len(token_ids))
         self._last_token_id = token_ids[-1]
+        self._gauge("kv_seq_len", self.kv.seq_len())
 
     # ------------------------------------------------------------------
     # Core: draft γ tokens
@@ -283,35 +345,47 @@ class DraftEngine:
         if self._last_token_id is None:
             raise RuntimeError("Call load_prompt() or extend() before draft().")
 
-        t0 = time.perf_counter()
         token_ids: list[int] = []
         token_logprobs: list[float] = []
         eos_id: int = self._llm.token_eos()
 
-        for _ in range(gamma):
-            logits = self._get_logits()    # list[float] of length vocab_size
-            next_id = int(self._argmax(logits))
+        t_draft_start = time.perf_counter()
 
-            # Log-prob of the chosen token (for acceptance ratio in stochastic SD)
-            import math
-            max_logit = max(logits)
-            log_z = math.log(sum(math.exp(l - max_logit) for l in logits)) + max_logit
-            log_prob = logits[next_id] - log_z
+        with self._time("draft_ms"):
+            for _ in range(gamma):
+                with self._time("sample_ms"):
+                    logits = self._get_logits()    # list[float] of length vocab_size
+                    next_id = int(self._argmax(logits))
 
-            token_ids.append(next_id)
-            token_logprobs.append(log_prob)
+                    # Log-prob of the chosen token (for acceptance ratio in stochastic SD)
+                    max_logit = max(logits)
+                    log_z = math.log(sum(math.exp(l - max_logit) for l in logits)) + max_logit
+                    log_prob = logits[next_id] - log_z
 
-            if next_id == eos_id:
-                # Don't eval past EOS — leave cache at this position
+                token_ids.append(next_id)
+                token_logprobs.append(log_prob)
+                self._count("tokens_generated", 1)
+
+                if next_id == eos_id:
+                    # Don't eval past EOS — leave cache at this position
+                    self._last_token_id = next_id
+                    self._count("eos_hits", 1)
+                    break
+
+                # Eval the chosen token so llama.cpp appends it to the KV cache
+                with self._time("eval_ms"):
+                    self._llm.eval([next_id])
+                self.kv._advance(1)
                 self._last_token_id = next_id
-                break
+                self._gauge("kv_seq_len", self.kv.seq_len())
 
-            # Eval the chosen token so llama.cpp appends it to the KV cache
-            self._llm.eval([next_id])
-            self.kv._advance(1)
-            self._last_token_id = next_id
+        self._count("draft_steps", 1)
 
-        wall_ms = (time.perf_counter() - t0) * 1000.0
+        # Wall-clock for this draft step (fall back to measuring ourselves)
+        wall_ms = self._last_timing("draft_ms")
+        if wall_ms == 0.0:
+            wall_ms = (time.perf_counter() - t_draft_start) * 1000.0
+
         return DraftResult(
             token_ids=token_ids,
             token_logprobs=token_logprobs,
@@ -357,7 +431,7 @@ class DraftEngine:
             engine.rollback(accept_count)
             engine.extend([last_accepted_id])
         """
-        self._checkpoint_before_draft: int = self.kv.seq_len()
+        self._checkpoint_before_draft = self.kv.seq_len()
 
     def extend(self, token_ids: list[int]) -> None:
         """
@@ -390,7 +464,6 @@ class DraftEngine:
         returns a ctypes pointer to `n_vocab` floats for the last token in
         the batch.  This works regardless of `logits_all`.
         """
-        import ctypes
         n_vocab = self._llm._n_vocab
         logits_ptr = self._llm._ctx.get_logits_ith(-1)
         # Build a Python list from the ctypes float array.
@@ -428,18 +501,22 @@ class DraftEngine:
         eos_id = self._llm.token_eos()
         generated_ids: list[int] = []
 
-        t0 = time.perf_counter()
-        for _ in range(max_new_tokens):
-            logits = self._get_logits()
-            next_id = int(self._argmax(logits))
-            if next_id == eos_id:
-                break
-            generated_ids.append(next_id)
-            self._llm.eval([next_id])
-            self.kv._advance(1)
-            self._last_token_id = next_id
+        with self._time_request():
+            for _ in range(max_new_tokens):
+                next_id = int(self._argmax(self._get_logits()))
+                if next_id == eos_id:
+                    self._count("eos_hits", 1)
+                    break
+                generated_ids.append(next_id)
+                with self._time("eval_ms"):
+                    self._llm.eval([next_id])
+                self.kv._advance(1)
+                self._last_token_id = next_id
+                self._count("tokens_generated", 1)
+                self._gauge("kv_seq_len", self.kv.seq_len())
 
-        elapsed = time.perf_counter() - t0
+        e2e_ms = self._last_timing("e2e_latency_ms")
+        elapsed = e2e_ms / 1000.0 if e2e_ms > 0 else 0.0
         tok_per_sec = len(generated_ids) / elapsed if elapsed > 0 else 0.0
 
         text = self._llm.detokenize(generated_ids).decode("utf-8", errors="replace")
@@ -450,11 +527,15 @@ class DraftEngine:
                 f"({tok_per_sec:.1f} tok/s)",
                 flush=True,
             )
+
+        if self._profiler is not None:
+            self._profiler.report()
+
         return text
 
 
 # ---------------------------------------------------------------------------
-# Interactive REPL  (python inference.py --model <path>)
+# Interactive REPL  (python draft_engine.py --model <path>)
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -485,13 +566,20 @@ def main() -> None:
         "--verbose", action="store_true",
         help="Show llama.cpp internal logs."
     )
+    parser.add_argument(
+        "--no-profiler", action="store_true",
+        help="Disable the profiler entirely."
+    )
     args = parser.parse_args()
+
+    prof = None if args.no_profiler else Profiler()
 
     engine = DraftEngine.from_path(
         model_path=args.model,
         n_ctx=args.n_ctx,
         n_threads=args.n_threads,
         verbose=args.verbose,
+        profiler=prof,
     )
 
     print("=" * 60)

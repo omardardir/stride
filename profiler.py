@@ -459,13 +459,24 @@ class Profiler:
     def throughput(self, prefix: str) -> float:
         """
         Output token throughput for a given prefix, in tokens/second.
-        Computed as: tokens_generated / total_decode_time_s
+        Computed as: tokens_generated / total_per_token_time_s
         (decode phase only — does not include prefill time).
+
+        Looks for decode_ms first (target/GPU engine); falls back to eval_ms
+        (draft/CPU engine) so both engines produce a throughput figure.
         """
         with self._lock:
             timing_dict = self._timings.get(prefix)
-            decode_series = timing_dict.get("decode_ms") if timing_dict else None
-            total_ms = decode_series.total() if decode_series else 0.0
+            # Prefer decode_ms (target engine); fall back to eval_ms (draft engine)
+            series = None
+            if timing_dict:
+                dec = timing_dict.get("decode_ms")
+                evl = timing_dict.get("eval_ms")
+                if dec and dec.count() > 0:
+                    series = dec
+                elif evl and evl.count() > 0:
+                    series = evl
+            total_ms = series.total() if series else 0.0
             counter_dict = self._counters.get(prefix)
             total_tok = counter_dict.get("tokens_generated", 0) if counter_dict else 0
         if total_ms <= 0 or total_tok == 0:
@@ -547,7 +558,7 @@ class Profiler:
                 # Determine column order: known metrics first, then any extras
                 ordered = [m for m in self._TIMING_METRICS if m in timing_keys]
                 ordered += [m for m in timing_keys if m not in self._TIMING_METRICS]
-                header = f"  {'metric':<20} {'count':>6} {'mean':>8} {'p50':>8} {'p95':>8} {'p99':>8} {'min':>8} {'max':>8}"
+                header = f"  {'metric':<24} {'count':>7} {'mean':>12} {'p50':>12} {'p95':>12} {'p99':>12} {'min':>12} {'max':>12}"
                 print(header)
                 print("  " + "-" * (len(header) - 2))
                 for metric in ordered:
@@ -557,10 +568,10 @@ class Profiler:
                             continue
                         row = s.to_dict()
                     print(
-                        f"  {metric:<20} {row['count']:>6} "
-                        f"{row['mean_ms']:>7.2f}ms {row['p50_ms']:>7.2f}ms "
-                        f"{row['p95_ms']:>7.2f}ms {row['p99_ms']:>7.2f}ms "
-                        f"{row['min_ms']:>7.2f}ms {row['max_ms']:>7.2f}ms"
+                        f"  {metric:<24} {row['count']:>7} "
+                        f"{row['mean_ms']:>11.2f}ms {row['p50_ms']:>11.2f}ms "
+                        f"{row['p95_ms']:>11.2f}ms {row['p99_ms']:>11.2f}ms "
+                        f"{row['min_ms']:>11.2f}ms {row['max_ms']:>11.2f}ms"
                     )
 
             # --- Counters ---

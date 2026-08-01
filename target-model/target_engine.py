@@ -255,6 +255,11 @@ class TargetEngine:
             quantization_config=QUANT_CONFIG,
             device_map=device,           # force everything onto GPU 0
             trust_remote_code=True,
+            # Explicitly lock to SDPA (PyTorch's fused mem_efficient_attention kernel).
+            # Flash Attention 2 requires CC >= 8.0 (Ampere); MX450 is CC 7.5 (Turing).
+            # Without this, Transformers resolves the backend implicitly at load time
+            # and a future library update could silently regress to eager attention.
+            attn_implementation="sdpa",
         )
         model.eval()
 

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import sys
 import os
+import json
 import time
+import datetime
 import argparse
 import statistics
 from dataclasses import dataclass, field
@@ -228,6 +230,115 @@ def _print_aggregate(results: list[RequestResult]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# JSONL metrics log helpers
+# ---------------------------------------------------------------------------
+
+def _percentile(vals: list[float], p: float) -> float:
+    """Linear-interpolation percentile matching profiler.Profiler.percentile()."""
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    idx = (p / 100.0) * (len(s) - 1)
+    lo, hi = int(idx), min(int(idx) + 1, len(s) - 1)
+    return s[lo] + (idx - lo) * (s[hi] - s[lo])
+
+
+def _agg(vals: list[float]) -> dict:
+    """Return mean/p50/p95/min/max for a list of floats, or {} if empty."""
+    if not vals:
+        return {}
+    return {
+        "mean": round(statistics.mean(vals), 3),
+        "p50":  round(_percentile(vals, 50), 3),
+        "p95":  round(_percentile(vals, 95), 3),
+        "min":  round(min(vals), 3),
+        "max":  round(max(vals), 3),
+    }
+
+
+def _append_jsonl(
+    path: str,
+    description: str,
+    model_path: str,
+    gamma: int,
+    n_ctx: int,
+    n_threads: int,
+    max_tokens: int,
+    n_warmup: int,
+    results: list[RequestResult],
+    prof: Optional[Profiler],
+) -> None:
+    """
+    Append one flat JSON record to the JSONL metrics log.
+
+    Flat column layout so ``pd.read_json(path, lines=True)`` gives a
+    directly queryable DataFrame with one row per run.
+    """
+    gen_agg     = _agg([r.gen_ms for r in results])
+    prefill_agg = _agg([r.prefill_ms for r in results if r.prefill_ms > 0])
+    tput_agg    = _agg([r.tok_per_sec for r in results])
+
+    record: dict = {
+        # --- metadata ---
+        "description":  description,
+        "timestamp":    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "engine":       "draft",
+        "model":        model_path,
+        "gamma":        gamma,
+        "n_ctx":        n_ctx,
+        "n_threads":    n_threads,
+        "max_tokens":   max_tokens,
+        "n_warmup":     n_warmup,
+        "n_requests":   len(results),
+        # --- aggregate (benchmark-measured) ---
+        "total_output_tokens": sum(r.output_tokens for r in results),
+        **{f"gen_ms_{k}": v for k, v in gen_agg.items()},
+        **{f"tok_per_sec_{k}": v for k, v in tput_agg.items()},
+    }
+
+    if prefill_agg:
+        record.update({f"prefill_ms_{k}": v for k, v in prefill_agg.items()})
+
+    # --- profiler aggregate (if enabled) ---
+    if prof is not None:
+        export   = prof.export()
+        dp       = export["prefixes"].get("draft", {})
+        timings  = dp.get("timings", {})
+        counters = dp.get("counters", {})
+        for metric in ("eval_ms", "prefill_ms", "draft_ms", "sample_ms"):
+            t = timings.get(metric)
+            if t:
+                record[f"profiler_{metric}_mean"] = t["mean_ms"]
+                record[f"profiler_{metric}_p50"]  = t["p50_ms"]
+                record[f"profiler_{metric}_p95"]  = t["p95_ms"]
+                record[f"profiler_{metric}_p99"]  = t["p99_ms"]
+                record[f"profiler_{metric}_min"]  = t["min_ms"]
+                record[f"profiler_{metric}_max"]  = t["max_ms"]
+        for ctr in ("tokens_generated", "requests_completed", "eos_hits",
+                    "draft_steps", "cache_clears", "cache_rollbacks"):
+            if ctr in counters:
+                record[ctr] = counters[ctr]
+        record["tok_throughput_profiler"] = round(dp.get("throughput_tok_per_s", 0.0), 2)
+
+    # --- per-request breakdown ---
+    record["requests"] = [
+        {
+            "label":         r.label,
+            "prompt_tokens": r.prompt_tokens,
+            "output_tokens": r.output_tokens,
+            "prefill_ms":    round(r.prefill_ms, 3),
+            "gen_ms":        round(r.gen_ms, 3),
+            "tok_per_sec":   round(r.tok_per_sec, 3),
+        }
+        for r in results
+    ]
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"[bench] Metrics appended to {path}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -240,6 +351,8 @@ def run_benchmark(
     n_warmup: int,
     n_requests: int,
     use_profiler: bool,
+    description: str = "unnamed",
+    jsonl_path: Optional[str] = None,
 ) -> None:
     prof: Optional[Profiler] = Profiler() if use_profiler else None
 
@@ -302,6 +415,23 @@ def run_benchmark(
         print("\n  ── Profiler detail ───────────────────────────────────────────")
         prof.report()
 
+    # ------------------------------------------------------------------
+    # JSONL metrics log
+    # ------------------------------------------------------------------
+    if jsonl_path is not None:
+        _append_jsonl(
+            path=jsonl_path,
+            description=description,
+            model_path=model_path,
+            gamma=gamma,
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            max_tokens=max_tokens,
+            n_warmup=n_warmup,
+            results=results,
+            prof=prof,
+        )
+
     print(f"{'═' * 90}\n")
 
 
@@ -341,6 +471,10 @@ def main() -> None:
         "--no-profiler", action="store_true",
         help="Disable the Profiler (only show benchmark table)."
     )
+    parser.add_argument(
+        "--description", default="unnamed",
+        help="Label for this run, written to bench-metrics.jsonl (default: \"unnamed\")."
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -352,6 +486,8 @@ def main() -> None:
         n_warmup=args.warmup,
         n_requests=args.requests,
         use_profiler=not args.no_profiler,
+        description=args.description,
+        jsonl_path=os.path.join(_HERE, "bench-metrics.jsonl"),
     )
 
 

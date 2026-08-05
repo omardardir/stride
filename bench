@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # bench — run a benchmark script and append results to BENCH_LOG.md
+#         and bench-metrics.jsonl (written by the Python script itself).
 #
 # Usage (from project root):
 #   bench "description of this run" path/to/run_benchmark.py [extra args...]
@@ -9,8 +10,10 @@
 #
 # - stderr (library warnings, model-loader notices, CUDA messages) goes to your
 #   terminal so you can see any errors, but is NOT written to the log.
-# - Only the clean benchmark stdout (tables, stats) is saved to the log.
+# - Only the clean benchmark stdout (tables, stats) is saved to BENCH_LOG.md.
 # - Stdout is also printed to the terminal in real-time.
+# - bench-metrics.jsonl is written directly by run_benchmark.py (via --description).
+#   Each line is one JSON object; read with pd.read_json(..., lines=True).
 
 set -euo pipefail
 
@@ -40,6 +43,7 @@ EXTRA_ARGS=("$@")
 SCRIPT_ABS="$(realpath "$SCRIPT")"
 SCRIPT_DIR="$(dirname "$SCRIPT_ABS")"
 LOG_FILE="$SCRIPT_DIR/BENCH_LOG.md"
+JSONL_FILE="$SCRIPT_DIR/bench-metrics.jsonl"
 
 if [[ ! -f "$SCRIPT_ABS" ]]; then
     echo "Error: benchmark script not found: $SCRIPT_ABS" >&2
@@ -68,7 +72,8 @@ echo ""
 echo "╔══════════════════════════════════════════════════════════════════╗"
 printf "║  bench: %-57s║\n" "$DESCRIPTION"
 echo "╚══════════════════════════════════════════════════════════════════╝"
-echo "  log → $LOG_FILE"
+echo "  log  → $LOG_FILE"
+echo "  jsonl → $JSONL_FILE"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -76,11 +81,12 @@ echo ""
 #   - stdout is streamed to the terminal AND saved to a temp file (via tee)
 #   - stderr flows naturally to the terminal (errors visible) but is NOT
 #     captured by the pipe, so it never ends up in the log file
+#   - --description is forwarded so run_benchmark.py can label the JSONL entry
 # ---------------------------------------------------------------------------
 TMPFILE="$(mktemp /tmp/bench_output.XXXXXX)"
 trap 'rm -f "$TMPFILE"' EXIT
 
-PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "$PYTHON" "$SCRIPT_ABS" "${EXTRA_ARGS[@]}" | tee "$TMPFILE"
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "$PYTHON" "$SCRIPT_ABS" --description "$DESCRIPTION" "${EXTRA_ARGS[@]}" | tee "$TMPFILE"
 
 # Filter: only keep from the ═══ separator before "Per-request results" onwards.
 # The terminal already showed everything live; the log gets the clean summary only.
@@ -106,3 +112,4 @@ fi
 
 echo ""
 echo "✓  Results appended to $LOG_FILE"
+echo "✓  Metrics appended to $JSONL_FILE"

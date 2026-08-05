@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import sys
 import os
+import json
 import time
+import datetime
 import argparse
 import statistics
 from dataclasses import dataclass
@@ -302,6 +304,122 @@ def _print_aggregate(results: list[RequestResult]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# JSONL metrics log helpers
+# ---------------------------------------------------------------------------
+
+def _agg(vals: list[float]) -> dict:
+    """Return mean/p50/p95/min/max for a list of floats, or {} if empty."""
+    if not vals:
+        return {}
+    return {
+        "mean": round(statistics.mean(vals), 3),
+        "p50":  round(_percentile(vals, 50), 3),
+        "p95":  round(_percentile(vals, 95), 3),
+        "min":  round(min(vals), 3),
+        "max":  round(max(vals), 3),
+    }
+
+
+def _append_jsonl(
+    path: str,
+    description: str,
+    model_id: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    rep_penalty: float,
+    n_warmup: int,
+    results: list[RequestResult],
+    prof: Optional[Profiler],
+) -> None:
+    """
+    Append one flat JSON record to the JSONL metrics log.
+
+    Flat column layout so ``pd.read_json(path, lines=True)`` gives a
+    directly queryable DataFrame with one row per run::
+
+        df = pd.read_json("bench-metrics.jsonl", lines=True)
+        baseline  = df[df.description == "baseline"].iloc[-1]
+        quantized = df[df.description == "quantized-kv-4bit"].iloc[-1]
+        pct = (quantized.decode_ms_mean / baseline.decode_ms_mean - 1) * 100
+    """
+    e2e_agg   = _agg([r.e2e_ms for r in results])
+    tput_agg  = _agg([r.tok_per_sec for r in results])
+    ttft_vals = [r.ttft_ms for r in results if r.ttft_ms > 0]
+    ttft_agg  = _agg(ttft_vals)
+    dec_vals  = [r.decode_mean_ms for r in results if r.decode_mean_ms > 0]
+    dec_agg   = _agg(dec_vals)
+
+    record: dict = {
+        # --- metadata ---
+        "description": description,
+        "timestamp":   datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "engine":      "target",
+        "model":       model_id,
+        "max_tokens":  max_tokens,
+        "temperature": temperature,
+        "top_p":       top_p,
+        "rep_penalty": rep_penalty,
+        "n_warmup":    n_warmup,
+        "n_requests":  len(results),
+        # --- aggregate (benchmark-measured) ---
+        "total_output_tokens": sum(r.output_tokens for r in results),
+        **{f"e2e_ms_{k}": v for k, v in e2e_agg.items()},
+        **{f"tok_per_sec_{k}": v for k, v in tput_agg.items()},
+    }
+
+    if ttft_agg:
+        record.update({f"ttft_ms_{k}": v for k, v in ttft_agg.items()})
+    if dec_agg:
+        # decode_ms_mean is the canonical column for latency comparisons
+        record.update({f"decode_ms_{k}": v for k, v in dec_agg.items()})
+
+    # --- profiler aggregate (if enabled) ---
+    if prof is not None:
+        export   = prof.export()
+        dp       = export["prefixes"].get("target", {})
+        timings  = dp.get("timings", {})
+        counters = dp.get("counters", {})
+        gauges   = dp.get("gauges", {})
+        for metric in ("decode_ms", "prefill_ms", "sample_ms", "e2e_latency_ms"):
+            t = timings.get(metric)
+            if t:
+                record[f"profiler_{metric}_mean"] = t["mean_ms"]
+                record[f"profiler_{metric}_p50"]  = t["p50_ms"]
+                record[f"profiler_{metric}_p95"]  = t["p95_ms"]
+                record[f"profiler_{metric}_p99"]  = t["p99_ms"]
+                record[f"profiler_{metric}_min"]  = t["min_ms"]
+                record[f"profiler_{metric}_max"]  = t["max_ms"]
+        for ctr in ("tokens_generated", "requests_completed", "eos_hits",
+                    "cache_clears", "cache_rollbacks"):
+            if ctr in counters:
+                record[ctr] = counters[ctr]
+        record["tok_throughput_profiler"] = round(dp.get("throughput_tok_per_s", 0.0), 2)
+        vram = gauges.get("vram_used_mb")
+        if vram:
+            record["vram_used_mb_mean"]   = vram["mean"]
+            record["vram_used_mb_latest"] = vram["latest"]
+
+    # --- per-request breakdown ---
+    record["requests"] = [
+        {
+            "label":          r.label,
+            "prompt_tokens":  r.prompt_tokens,
+            "output_tokens":  r.output_tokens,
+            "ttft_ms":        round(r.ttft_ms, 3),
+            "decode_mean_ms": round(r.decode_mean_ms, 3),
+            "e2e_ms":         round(r.e2e_ms, 3),
+            "tok_per_sec":    round(r.tok_per_sec, 3),
+        }
+        for r in results
+    ]
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"[bench] Metrics appended to {path}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # VRAM snapshot helper
 # ---------------------------------------------------------------------------
 
@@ -328,6 +446,8 @@ def run_benchmark(
     n_requests: int,
     use_profiler: bool,
     system: str,
+    description: str = "unnamed",
+    jsonl_path: Optional[str] = None,
 ) -> None:
     prof: Optional[Profiler] = Profiler() if use_profiler else None
 
@@ -412,6 +532,23 @@ def run_benchmark(
         print("\n  ── Profiler detail ─────────────────────────────────────────────────")
         prof.report()
 
+    # ------------------------------------------------------------------
+    # JSONL metrics log
+    # ------------------------------------------------------------------
+    if jsonl_path is not None:
+        _append_jsonl(
+            path=jsonl_path,
+            description=description,
+            model_id=model_id,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            rep_penalty=rep_penalty,
+            n_warmup=n_warmup,
+            results=results,
+            prof=prof,
+        )
+
     print(f"\n{'═' * 100}\n")
 
 
@@ -455,6 +592,10 @@ def main() -> None:
         "--no-profiler", action="store_true",
         help="Disable the Profiler (only show benchmark table)."
     )
+    parser.add_argument(
+        "--description", default="unnamed",
+        help="Label for this run, written to bench-metrics.jsonl (default: \"unnamed\")."
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -467,6 +608,8 @@ def main() -> None:
         n_requests=args.requests,
         use_profiler=not args.no_profiler,
         system=args.system,
+        description=args.description,
+        jsonl_path=os.path.join(_HERE, "bench-metrics.jsonl"),
     )
 
 

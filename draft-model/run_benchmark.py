@@ -213,7 +213,7 @@ def _print_aggregate(results: list[RequestResult]) -> None:
         return (
             f"mean={statistics.mean(vals):.1f}  "
             f"p50={statistics.median(vals):.1f}  "
-            f"p95={sorted(vals)[int(len(vals) * 0.95)]:.1f}  "
+            f"p95={sorted(vals)[int((len(vals) - 1) * 0.95)]:.1f}  "
             f"min={min(vals):.1f}  max={max(vals):.1f}"
         )
 

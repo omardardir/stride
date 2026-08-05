@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# bench — run a benchmark script and append results to BENCH_LOG.md
+#
+# Usage (from project root):
+#   bench "description of this run" path/to/run_benchmark.py [extra args...]
+#
+# Example:
+#   bench "after switching to flash attention" draft-model/run_benchmark.py
+#
+# - stderr (library warnings, model-loader notices, CUDA messages) goes to your
+#   terminal so you can see any errors, but is NOT written to the log.
+# - Only the clean benchmark stdout (tables, stats) is saved to the log.
+# - Stdout is also printed to the terminal in real-time.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Argument validation
+# ---------------------------------------------------------------------------
+if [[ $# -lt 2 ]]; then
+    cat >&2 <<'EOF'
+Usage: bench "<description>" <path/to/run_benchmark.py> [extra args...]
+
+Examples:
+  bench "baseline"                         draft-model/run_benchmark.py
+  bench "after flash attention"            target-model/run_benchmark.py
+  bench "gamma=8 test" draft-model/run_benchmark.py --gamma 8 --requests 12
+EOF
+    exit 1
+fi
+
+DESCRIPTION="$1"
+SCRIPT="$2"
+shift 2
+EXTRA_ARGS=("$@")
+
+# ---------------------------------------------------------------------------
+# Resolve paths
+# ---------------------------------------------------------------------------
+SCRIPT_ABS="$(realpath "$SCRIPT")"
+SCRIPT_DIR="$(dirname "$SCRIPT_ABS")"
+LOG_FILE="$SCRIPT_DIR/BENCH_LOG.md"
+
+if [[ ! -f "$SCRIPT_ABS" ]]; then
+    echo "Error: benchmark script not found: $SCRIPT_ABS" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Determine the Python interpreter
+# Prefer the project's .venv; fall back to whatever is on PATH.
+# ---------------------------------------------------------------------------
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+elif [[ -x "$REPO_ROOT/.venv/Scripts/python.exe" ]]; then
+    PYTHON="$REPO_ROOT/.venv/Scripts/python.exe"
+else
+    PYTHON="${PYTHON:-python}"
+fi
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════════╗"
+printf "║  bench: %-57s║\n" "$DESCRIPTION"
+echo "╚══════════════════════════════════════════════════════════════════╝"
+echo "  log → $LOG_FILE"
+echo ""
+
+# ---------------------------------------------------------------------------
+# Run benchmark
+#   - stdout is streamed to the terminal AND saved to a temp file (via tee)
+#   - stderr flows naturally to the terminal (errors visible) but is NOT
+#     captured by the pipe, so it never ends up in the log file
+# ---------------------------------------------------------------------------
+TMPFILE="$(mktemp /tmp/bench_output.XXXXXX)"
+trap 'rm -f "$TMPFILE"' EXIT
+
+PYTHONUTF8=1 PYTHONIOENCODING=utf-8 "$PYTHON" "$SCRIPT_ABS" "${EXTRA_ARGS[@]}" | tee "$TMPFILE"
+
+# Filter: only keep from the ═══ separator before "Per-request results" onwards.
+# The terminal already showed everything live; the log gets the clean summary only.
+START_LINE="$(grep -n "Per-request results" "$TMPFILE" | head -1 | cut -d: -f1)"
+if [[ -n "$START_LINE" && "$START_LINE" -gt 2 ]]; then
+    BENCH_OUTPUT="$(tail -n "+$((START_LINE - 2))" "$TMPFILE")"
+else
+    BENCH_OUTPUT="$(cat "$TMPFILE")"
+fi
+
+# ---------------------------------------------------------------------------
+# Append to BENCH_LOG.md
+# ---------------------------------------------------------------------------
+{
+    printf '\n---\n\n'
+    printf '## %s\n\n' "$DESCRIPTION"
+    printf '> **Date:** %s  \n' "$TIMESTAMP"
+    printf '> **Script:** `%s`\n\n' "$SCRIPT_ABS"
+    printf '```\n'
+    printf '%s\n' "$BENCH_OUTPUT"
+    printf '```\n\n'
+} >> "$LOG_FILE"
+
+echo ""
+echo "✓  Results appended to $LOG_FILE"

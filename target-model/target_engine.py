@@ -277,6 +277,12 @@ class TargetEngine:
             return self._profiler.time("target", metric)
         return contextlib.nullcontext()
 
+    def _cuda_event_time(self, metric: str):
+        """True GPU kernel timing via torch.cuda.Event (sync on exit)."""
+        if self._profiler is not None:
+            return self._profiler.cuda_event_time("target", metric)
+        return contextlib.nullcontext()
+
     def _time_request(self):
         if self._profiler is not None:
             return self._profiler.time_request("target")
@@ -329,7 +335,7 @@ class TargetEngine:
         ).unsqueeze(0)  # [1, prompt_len]
 
         with torch.inference_mode():
-            with self._time("prefill_ms"):
+            with self._cuda_event_time("prefill_ms"):
                 outputs = self._model(
                     input_ids=input_ids,
                     position_ids=prefill_position_ids,
@@ -367,7 +373,7 @@ class TargetEngine:
             )  # [1, 1]
 
             with torch.inference_mode():
-                with self._time("decode_ms"):
+                with self._cuda_event_time("decode_ms"):
                     outputs = self._model(
                         input_ids=next_input,
                         position_ids=decode_position_ids,

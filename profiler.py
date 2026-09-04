@@ -325,6 +325,8 @@ class Profiler:
         try:
             yield
         finally:
+            if _TORCH_AVAILABLE and _torch.cuda.is_available() and not self.wall_clock_gpu:
+                _torch.cuda.synchronize()
             ms = (time.perf_counter_ns() - t0) / 1_000_000.0
             self.record_timing(prefix, "e2e_latency_ms", ms)
             self.count(prefix, "requests_completed", 1)
@@ -356,7 +358,7 @@ class Profiler:
                 _torch.cuda.synchronize()
                 ms = start_ev.elapsed_time(end_ev)  # ms, float
                 self.record_timing(prefix, metric, ms)
-        else:
+        else    :
             # Fallback: wall-clock
             with self.time(prefix, metric):
                 yield

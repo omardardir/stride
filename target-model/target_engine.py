@@ -29,6 +29,7 @@ from typing import Optional
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from kv_cache_manager import KVCacheManager
 
 # Add the project root to sys.path so we can import profiler.py from the
 # parent directory regardless of where the script is invoked from.
@@ -223,11 +224,13 @@ class TargetEngine:
         model: AutoModelForCausalLM,
         profiler: Optional[Profiler] = None,
         device: str = DEVICE,
+        #kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> None:
         self._tokenizer = tokenizer
         self._model = model
         self._profiler = profiler
         self._device = device
+        #self._kv_cache_manager = kv_cache_manager
 
     # ------------------------------------------------------------------
     # Construction
@@ -265,6 +268,9 @@ class TargetEngine:
 
         used_gb = torch.cuda.memory_allocated() / 1e9
         print(f"[INFO] Model loaded — VRAM in use: {used_gb:.2f} GB\n")
+
+        # Pre-allocate the KV cache pool from remaining free VRAM (optional / WIP)
+        # kv_mgr = KVCacheManager.initialize(device=device)
 
         return cls(tokenizer, model, profiler=profiler, device=device)
 
@@ -433,16 +439,17 @@ class TargetEngine:
             {"role": "user",   "content": prompt},
         ]
 
-        text = self._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        inputs = self._tokenizer([text], return_tensors="pt").to(self._device)
-        input_ids = inputs["input_ids"]
-
         # Run our custom loop (full request timed end-to-end)
         with self._time_request():
+            with self._time("tokenize_ms"):
+                text = self._tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                inputs = self._tokenizer([text], return_tensors="pt").to(self._device)
+                input_ids = inputs["input_ids"]
+
             generated_ids = self._run_generation(
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,

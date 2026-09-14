@@ -127,6 +127,7 @@ class RequestResult:
     label: str
     prompt_tokens: int       # tokens in the formatted prompt (including chat template)
     output_tokens: int       # tokens actually generated
+    tokenize_ms: float       # time to tokenize prompt
     ttft_ms: float           # time to first token (prefill wall-clock)
     decode_mean_ms: float    # mean per-token decode latency
     e2e_ms: float            # full wall-clock for generate()
@@ -175,11 +176,14 @@ def _run_single_request(
     # Snapshot profiler counters before the call so we can compute deltas
     prefill_count_before = 0
     decode_count_before  = 0
+    tokenize_count_before = 0
     if prof is not None:
         s = _snapshot_profiler_timing(prof, "target", "prefill_ms")
         prefill_count_before = len(s) if s else 0
         s = _snapshot_profiler_timing(prof, "target", "decode_ms")
         decode_count_before  = len(s) if s else 0
+        s = _snapshot_profiler_timing(prof, "target", "tokenize_ms")
+        tokenize_count_before = len(s) if s else 0
 
     t0 = time.perf_counter()
     engine.generate(
@@ -194,14 +198,21 @@ def _run_single_request(
     e2e_ms = (time.perf_counter() - t0) * 1000.0
 
     # --- Derive metrics from profiler samples (delta since before the call) ---
-    ttft_ms       = 0.0
+    tokenize_ms    = 0.0
+    ttft_ms        = 0.0
     decode_mean_ms = 0.0
     output_tokens  = 0
 
     if prof is not None:
         prefill_samples = _snapshot_profiler_timing(prof, "target", "prefill_ms") or []
         new_prefill = prefill_samples[prefill_count_before:]
-        ttft_ms = new_prefill[-1] if new_prefill else 0.0
+        prefill_time = new_prefill[-1] if new_prefill else 0.0
+
+        tokenize_samples = _snapshot_profiler_timing(prof, "target", "tokenize_ms") or []
+        new_tokenize = tokenize_samples[tokenize_count_before:]
+        tokenize_ms = new_tokenize[-1] if new_tokenize else 0.0
+
+        ttft_ms = prefill_time + tokenize_ms
 
         decode_samples = _snapshot_profiler_timing(prof, "target", "decode_ms") or []
         new_decode = decode_samples[decode_count_before:]
@@ -215,6 +226,7 @@ def _run_single_request(
         label=label,
         prompt_tokens=prompt_tokens,
         output_tokens=output_tokens,
+        tokenize_ms=tokenize_ms,
         ttft_ms=ttft_ms,
         decode_mean_ms=decode_mean_ms,
         e2e_ms=e2e_ms,
@@ -286,6 +298,7 @@ def _print_aggregate(results: list[RequestResult]) -> None:
         )
 
     ttfts      = [r.ttft_ms for r in results if r.ttft_ms > 0]
+    tokenizes  = [r.tokenize_ms for r in results if r.tokenize_ms > 0]
     decodes    = [r.decode_mean_ms for r in results if r.decode_mean_ms > 0]
     e2es       = [r.e2e_ms for r in results]
     tputs      = [r.tok_per_sec for r in results]
@@ -295,8 +308,10 @@ def _print_aggregate(results: list[RequestResult]) -> None:
     print(f"  Requests          : {len(results)}")
     print(f"  Total output toks : {sum(out_tokens)}")
     print(f"  E2E latency       : {_stats(e2es, ' ms')}")
+    if tokenizes:
+        print(f"  Tokenization      : {_stats(tokenizes, ' ms')}")
     if ttfts:
-        print(f"  TTFT (prefill)    : {_stats(ttfts, ' ms')}")
+        print(f"  TTFT (total)      : {_stats(ttfts, ' ms')}")
     if decodes:
         print(f"  Decode latency    : {_stats(decodes, ' ms/tok')}")
     print(f"  Throughput        : {_stats(tputs, ' tok/s')}")
@@ -381,7 +396,7 @@ def _append_jsonl(
         timings  = dp.get("timings", {})
         counters = dp.get("counters", {})
         gauges   = dp.get("gauges", {})
-        for metric in ("decode_ms", "prefill_ms", "sample_ms", "e2e_latency_ms"):
+        for metric in ("decode_ms", "prefill_ms", "sample_ms", "e2e_latency_ms", "tokenize_ms"):
             t = timings.get(metric)
             if t:
                 record[f"profiler_{metric}_mean"] = t["mean_ms"]
@@ -406,6 +421,7 @@ def _append_jsonl(
             "label":          r.label,
             "prompt_tokens":  r.prompt_tokens,
             "output_tokens":  r.output_tokens,
+            "tokenize_ms":    round(r.tokenize_ms, 3),
             "ttft_ms":        round(r.ttft_ms, 3),
             "decode_mean_ms": round(r.decode_mean_ms, 3),
             "e2e_ms":         round(r.e2e_ms, 3),

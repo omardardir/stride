@@ -233,6 +233,7 @@ class Profiler:
     _TIMING_METRICS = [
         "ttft_ms",
         "e2e_latency_ms",
+        "tokenize_ms",
         "prefill_ms",
         "inter_token_latency_ms",
         "decode_ms",
@@ -265,7 +266,7 @@ class Profiler:
     def __init__(
         self,
         enabled: bool = True,
-        wall_clock_gpu: bool = True,
+        wall_clock_gpu: bool = False,
     ) -> None:
         self.enabled = enabled
         self.wall_clock_gpu = wall_clock_gpu

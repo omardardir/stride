@@ -224,13 +224,13 @@ class TargetEngine:
         model: AutoModelForCausalLM,
         profiler: Optional[Profiler] = None,
         device: str = DEVICE,
-        #kv_cache_manager: Optional[KVCacheManager] = None,
+        kv_cache_manager: Optional[KVCacheManager] = None,
     ) -> None:
         self._tokenizer = tokenizer
         self._model = model
         self._profiler = profiler
         self._device = device
-        #self._kv_cache_manager = kv_cache_manager
+        self._kv_cache_manager = kv_cache_manager
 
     # ------------------------------------------------------------------
     # Construction
@@ -270,9 +270,9 @@ class TargetEngine:
         print(f"[INFO] Model loaded — VRAM in use: {used_gb:.2f} GB\n")
 
         # Pre-allocate the KV cache pool from remaining free VRAM (optional / WIP)
-        # kv_mgr = KVCacheManager.initialize(device=device)
+        kv_mgr = KVCacheManager.initialize(device=device)
 
-        return cls(tokenizer, model, profiler=profiler, device=device)
+        return cls(tokenizer, model, profiler=profiler, device=device, kv_cache_manager=kv_mgr)
 
     # ------------------------------------------------------------------
     # Profiler helpers (no-op when profiler is None)

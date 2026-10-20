@@ -143,13 +143,13 @@ Results go in `bench/paged-kv/` (scripts + `.jsonl` + plots).
 **Done when:** all 5 questions and the OS-ideas list are answered, ≤ 5 sentences each.
 
 #### Session 2 — Read the source: how transformers handles the cache
-- [ ] Open `.venv/Lib/site-packages/transformers/cache_utils.py` (transformers **5.14.1**) and find:
-  - [ ] the base `Cache` class and the signature of `update(key_states, value_states, layer_idx, cache_kwargs)`
-  - [ ] how `DynamicCache` stores K/V and **how it grows** (torch.cat? preallocated?)
-  - [ ] how `StaticCache` preallocates, and what arguments it needs (`max_cache_len`, …). You'll use it as a baseline.
-  - [ ] which methods the model calls besides `update` (`get_seq_length`, `get_mask_sizes`, …?)
-- [ ] Open `models/qwen2/modeling_qwen2.py` and find where attention calls `past_key_values.update(...)`. Write down the **tensor shape** of `key_states` there (expected `[batch, kv_heads, seq, head_dim]`)
-- [ ] Write in `notes.md → Transformers internals`: "To plug in my cache I must implement: …" (a short list of methods)
+- [x] Open `.venv/Lib/site-packages/transformers/cache_utils.py` (transformers **5.14.1**) and find:
+  - [x] the base `Cache` class and the signature of `update(key_states, value_states, layer_idx, cache_kwargs)`
+  - [x] how `DynamicCache` stores K/V and **how it grows** (torch.cat? preallocated?)
+  - [x] how `StaticCache` preallocates, and what arguments it needs (`max_cache_len`, …). You'll use it as a baseline.
+  - [x] which methods the model calls besides `update` (`get_seq_length`, `get_mask_sizes`, …?)
+- [x] Open `models/qwen2/modeling_qwen2.py` and find where attention calls `past_key_values.update(...)`. Write down the **tensor shape** of `key_states` there (expected `[batch, kv_heads, seq, head_dim]`)
+- [x] Write in `notes.md → Transformers internals`: "To plug in my cache I must implement: …" (a short list of methods)
 - [ ] Draft write-up section 1 bullets: "How DynamicCache grows", "What StaticCache reserves"
 
 **Done when:** you can name every method your `PagedCache` must implement.

@@ -186,3 +186,13 @@ $RECYCLE.BIN/
 logs/
 tmp/
 temp/
+
+# =============================================================================
+# Profiling & write-ups
+# =============================================================================
+
+# Nsight Systems reports (.nsys-rep, .sqlite) and profile_forward.log
+profiles/
+
+# Write-ups
+writeups/
